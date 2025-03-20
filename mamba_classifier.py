@@ -4,7 +4,9 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-import math
+import matplotlib.pyplot as plt
+import numpy as np
+import cv2
 
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=64):
@@ -40,8 +42,8 @@ class SimpleMambaLayer(nn.Module):
         out_seq = self.out_proj(out_seq)
         return out_seq
 
-class VisionMambaClassifier(nn.Module):
 
+class VisionMambaClassifier(nn.Module):
     def __init__(self, img_size=32, patch_size=4, in_chans=3, embed_dim=64,
                  num_layers=4, num_classes=100):
         super().__init__()
@@ -58,6 +60,46 @@ class VisionMambaClassifier(nn.Module):
         x = x.mean(dim=1)
         logits = self.classifier(x)
         return logits
+
+
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        self._register_hooks()
+    
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self.activations = output.detach()
+        
+        def backward_hook(module, grad_input, grad_output):
+            self.gradients = grad_output[0].detach()
+        
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_backward_hook(backward_hook)
+    
+    def generate_cam(self, input_image, target_class):
+
+        self.model.zero_grad()
+        output = self.model(input_image)
+        score = output[0, target_class]
+        score.backward(retain_graph=True)
+
+        weights = self.gradients.mean(dim=(2, 3), keepdim=True)  # (1, C, 1, 1)
+        cam = torch.relu((weights * self.activations).sum(dim=1, keepdim=True))  # (1, 1, H', W')
+        cam = F.interpolate(cam, size=input_image.shape[2:], mode='bilinear', align_corners=False)
+        cam = cam.squeeze().cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)  # Normalize between 0 and 1
+        return cam
+
+def show_cam_on_image(img, cam, alpha=0.5):
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    heatmap = np.float32(heatmap) / 255.0
+    overlayed_img = heatmap * alpha + img
+    overlayed_img = overlayed_img / np.max(overlayed_img)
+    return np.uint8(255 * overlayed_img)
 
 def train(model, device, train_loader, optimizer, criterion, epoch):
     model.train()
@@ -105,6 +147,7 @@ def test(model, device, test_loader, criterion):
     print(f'Test Loss: {test_loss:.4f} Test Acc: {test_acc:.2f}%')
     return test_loss, test_acc
 
+
 def main():
     num_epochs = 20
     batch_size = 128
@@ -137,9 +180,35 @@ def main():
     for epoch in range(1, num_epochs + 1):
         train_loss, train_acc = train(model, device, train_loader, optimizer, criterion, epoch)
         test_loss, test_acc = test(model, device, test_loader, criterion)
-
+    
     torch.save(model.state_dict(), 'vision_mamba_cifar100.pth')
     print("Model saved as vision_mamba_cifar100.pth")
+
+    gradcam = GradCAM(model, model.patch_embed.proj)
+
+    sample_img, label = test_dataset[0]
+    sample_img_unsqueezed = sample_img.unsqueeze(0).to(device)
+
+    model.eval()
+    output = model(sample_img_unsqueezed)
+    pred_class = output.argmax(dim=1).item()
+    print(f"True label: {label}, Predicted label: {pred_class}")
+
+    cam = gradcam.generate_cam(sample_img_unsqueezed, target_class=pred_class)
+
+    mean = np.array([0.5071, 0.4867, 0.4408])
+    std = np.array([0.2675, 0.2565, 0.2761])
+    img_np = sample_img.cpu().numpy().transpose(1, 2, 0)
+    img_np = std * img_np + mean
+    img_np = np.clip(img_np, 0, 1)
+
+    overlayed_img = show_cam_on_image(img_np, cam, alpha=0.5)
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(overlayed_img)
+    plt.title(f"GradCAM for class {pred_class}")
+    plt.axis('off')
+    plt.show()
 
 if __name__ == '__main__':
     main()
